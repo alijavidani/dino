@@ -1,0 +1,5 @@
+/checkpoints/
+/previous_checkpoints/
+/outputs/
+/eval_linear/
+/__pycache__/
