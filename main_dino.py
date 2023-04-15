@@ -37,8 +37,8 @@ from augment import augmented_crop, correspondences
 import math
 
 #import os
-os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "nccl"
-os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
+# os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "nccl"
+# os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -124,12 +124,12 @@ def get_args_parser():
 
     # Misc
     # ImageNet path: /amin/imagenet/imagenet/train
-    parser.add_argument('--data_path', default='/home/alij/Datasets/Cifar10/pixel_data_label_train', type=str,
+    parser.add_argument('--data_path', default='F:\PhD\Datasets\cifar-10-batches-py\pixel_data_label_train', type=str,
         help='Please specify path to the ImageNet training data.')
-    parser.add_argument('--output_dir', default="./checkpoints/mean_patch32_out1000_tiny", type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--output_dir', default="./checkpoints/optimize-memory", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
-    parser.add_argument('--num_workers', default=15, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--num_workers', default=2, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
@@ -356,8 +356,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2], args.batch_size_per_gpu, args.local_crops_number, args.patch_size, args.global_scale, args.local_scale)  # only the 2 global views pass through the teacher
-            student_output = student(images, args.batch_size_per_gpu, args.local_crops_number, args.patch_size, args.global_scale, args.local_scale)
-            loss = dino_loss(student_output, teacher_output, data, epoch)
+            student_output1, student_output2 = student(images, args.batch_size_per_gpu, args.local_crops_number, args.patch_size, args.global_scale, args.local_scale)
+            loss = dino_loss(student_output1, student_output2, teacher_output, data, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -417,77 +417,88 @@ class DINOLoss(nn.Module):
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
 
-    def forward(self, student_output, teacher_output, data, epoch):
+    def forward(self, student_output1, student_output2, teacher_output, data, epoch):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
-        student_out = student_output / self.student_temp
-        student_out = student_out.chunk(self.ncrops)
+        student_out1 = student_output1 / self.student_temp
+        student_out1 = student_out1.chunk(2)
+
+        student_out2 = student_output2 / self.student_temp
+        student_out2 = student_out2.chunk(self.ncrops-2)
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
         teacher_out = teacher_out.detach().chunk(2)
 
-        total_loss = 0
-        total_loss_mean = 0
-        total_loss_sum = 0
-        n_loss_terms = 0
-        lamda = 0.7
+        student_out1_corr_permute = [torch.zeros(teacher_out[0].shape).cuda(),torch.zeros(teacher_out[0].shape).cuda()]
+        teacher_out1_corr_permute = [torch.zeros(teacher_out[0].shape).cuda(),torch.zeros(teacher_out[0].shape).cuda()]
+        student_out2_corr_permute = [torch.zeros(student_out2[0].shape).cuda(),torch.zeros(student_out2[0].shape).cuda(),
+                                     torch.zeros(student_out2[0].shape).cuda(),torch.zeros(student_out2[0].shape).cuda(),
+                                     torch.zeros(student_out2[0].shape).cuda(),torch.zeros(student_out2[0].shape).cuda(),
+                                     torch.zeros(student_out2[0].shape).cuda(),torch.zeros(student_out2[0].shape).cuda(),]
+        teacher_out2_corr_permute = [torch.zeros(student_out2[0].shape).cuda(),torch.zeros(student_out2[0].shape).cuda(),]
 
+        # Find the correspondences and permute teacher_out and student_out based on that:
         for iq, q in enumerate(teacher_out):
-            for v in range(len(student_out)):
+            for v in range(len(student_out1)):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
-
-                # loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
-                # total_loss += loss.mean()
-                # n_loss_terms += 1
-
                 for k in range(len(data)):
                     # Calculate patch correspondences:
                     corr = correspondences(data[k][iq], data[k][v])
-                    tensor1 = teacher_out[iq][k, corr.selected_crop1_patches, :]
-                    tensor2 = student_out[v][k, corr.selected_crop2_patches, :]
+                    teacher_out1_corr_permute[iq][k, 0:len(corr.selected_crop1_patches), :] = teacher_out[iq][k, corr.selected_crop1_patches, :]
+                    student_out1_corr_permute[v][k, 0:len(corr.selected_crop2_patches), :] = student_out1[v][k, corr.selected_crop2_patches, :]
 
-                    # Calculate Loss:
-                    tensor2_softmax = F.log_softmax(tensor2, dim=-1)
-                    cross_entropy_loss = - tensor1 * tensor2_softmax
-                    loss_sum = torch.sum(cross_entropy_loss, dim=-1)
-                    # step_loss = loss_sum.sum()
+        for iq, q in enumerate(teacher_out):
+            for v in range(len(student_out2)):
+                for k in range(len(data)):
+                    # Calculate patch correspondences:
+                    corr = correspondences(data[k][iq], data[k][v+2])
+                    teacher_out2_corr_permute[iq][k, 0:len(corr.selected_crop1_patches), :] = teacher_out[iq][k, corr.selected_crop1_patches, :]
+                    student_out2_corr_permute[v][k, 0:len(corr.selected_crop2_patches), :] = student_out2[v][k, corr.selected_crop2_patches, :]
 
-                    # total_loss_mean += loss_sum.mean()
 
-                    #Method3 loss function (mean):
-                    total_loss_sum += loss_sum.mean()
+        total_loss1 = 0
+        total_loss2 = 0
+        total_loss = 0
+        n_loss_terms1 = 0
+        n_loss_terms2 = 0
+        lamda = 0.7
 
-                    #Method2 loss function:
-                    # if len(loss_sum) == 1:
-                    #     total_loss_sum += loss_sum[0]
-                    # elif len(loss_sum) > 1:
-                    #     total_loss_sum += lamda * loss_sum[0] * (len(loss_sum)-1) + (1-lamda)*(loss_sum[1:].sum())
+        for iq, q in enumerate(teacher_out1_corr_permute):
+            for v in range(len(student_out1_corr_permute)):
+                if v == iq:
+                    # we skip cases where student and teacher operate on the same view
+                    continue
+                v_log_softmax1 = F.log_softmax(student_out1_corr_permute[v], dim=-1)
+                cross_entropy_loss1 = torch.sum(-q * v_log_softmax1, dim=-1)
 
-                    #Method1 loss function:
-                    # total_loss_sum += lamda * loss_sum[0] 
-                    # if len(loss_sum) > 1:
-                    #     total_loss_sum += (1-lamda)*(loss_sum[1:].mean())
-                   
-                    n_loss_terms += 1
-        total_loss = total_loss_sum / n_loss_terms
-                
-        # total_loss /= n_loss_terms
+                # Change line below's aggregation function (sum, mean, lambda, ...) for changing the loss function:
+                loss1 = torch.mean(cross_entropy_loss1, dim=-1)
+
+                total_loss1 += loss1.mean()
+                n_loss_terms1 += 1
+        # total_loss1 /= n_loss_terms1
+
+
+        for iq, q in enumerate(teacher_out2_corr_permute):
+            for v in range(len(student_out2_corr_permute)):
+                v_log_softmax2 = F.log_softmax(student_out2_corr_permute[v], dim=-1)
+                cross_entropy_loss2 = torch.sum(-q * v_log_softmax2, dim=-1)
+
+                # Change line below's aggregation function (sum, mean, lambda, ...) for changing the loss function:
+                loss2 = torch.mean(cross_entropy_loss2, dim=-1)
+
+                total_loss2 += loss2.mean()
+                n_loss_terms2 += 1
+        # total_loss2 /= n_loss_terms2
+
+        total_loss = (total_loss1+total_loss2)/(n_loss_terms1+n_loss_terms2)
         self.update_center(teacher_output)
         return total_loss
-
-        # Original Dino Loss Function:
-        # student_out_softmax = F.log_softmax(student_out[v], dim=-1)
-        # cross_entropy_loss = -q * student_out_softmax
-        # loss_sum = torch.sum(cross_entropy_loss, dim=-1)
-        # total_loss += loss_sum.mean()
-        # total_loss /= n_loss_terms
-        # self.update_center(teacher_output)
-        # return total_loss
 
     @torch.no_grad()
     def update_center(self, teacher_output):
@@ -542,12 +553,12 @@ class DataAugmentationDINO(object):
         ])
 
     def __call__(self, image):
-        global1 = augmented_crop(self.global_transfo1, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
-        global2 = augmented_crop(self.global_transfo2, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        global1 = augmented_crop(self.global_transfo1, image, patch_size=32, global_scale=224, local_scale=96)
+        global2 = augmented_crop(self.global_transfo2, image, patch_size=32, global_scale=224, local_scale=96)
         
         local_augmented_crops = []       
         for _ in range(self.local_crops_number):
-            local_augmented_crops.append(augmented_crop(self.local_transfo, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale))
+            local_augmented_crops.append(augmented_crop(self.local_transfo, image, patch_size=32, global_scale=224, local_scale=96))
 
         augmented_crops = [global1, global2] + local_augmented_crops
         return augmented_crops
