@@ -89,7 +89,7 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "pixel_data_label_train"), transform=train_transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -120,6 +120,9 @@ def eval_linear(args):
     )
     start_epoch = to_restore["epoch"]
     best_acc = to_restore["best_acc"]
+
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
     for epoch in range(start_epoch, args.epochs):
         train_loader.sampler.set_epoch(epoch)
@@ -157,6 +160,9 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     for (inp, target) in metric_logger.log_every(loader, 20, header):
+
+        # inp = data[0]
+
         # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
@@ -199,6 +205,9 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
     for inp, target in metric_logger.log_every(val_loader, 20, header):
+
+        # inp = data[0]
+
         # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)

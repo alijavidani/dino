@@ -33,6 +33,11 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from augment import augmented_crop, correspondences
+import math
+
+os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "nccl"
+os.environ["CUDA_VISIBLE_DEVICES"]="0,1,3"
 
 # import os
 os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "nccl"
@@ -150,8 +155,21 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+
+    # My added arguments:
+    parser.add_argument("--global_scale", default=224, type=int, help="size of upsampled image after crop to be fed to the teacher")
+    parser.add_argument("--local_scale", default=96, type=int, help="size of upsampled image after crop to be fed to the student")
+
     return parser
 
+def custom_collate(data):
+    augmented_crops = []
+    labels = []
+
+    for i in range(len(data)):
+        augmented_crops.append(data[i][0])
+        labels.append(data[i][1])
+    return augmented_crops, labels
 
 def train_dino(args):
     utils.init_distributed_mode(args)
@@ -162,6 +180,8 @@ def train_dino(args):
 
     # ============ preparing data ... ============
     transform = DataAugmentationDINO(
+        args.global_scale,
+        args.local_scale,
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
@@ -175,6 +195,7 @@ def train_dino(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=custom_collate
     )
     print(f"Data loaded: there are {len(dataset)} images.")
 
@@ -237,6 +258,7 @@ def train_dino(args):
 
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
+        args.patch_size,
         args.out_dim,
         args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
         args.warmup_teacher_temp,
@@ -327,7 +349,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (data, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -335,13 +357,29 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
 
+        # Decompose data:
+        images =[
+            torch.empty((len(data),3,args.global_scale,args.global_scale)),torch.empty((len(data),3,args.global_scale,args.global_scale)),
+            torch.empty((len(data),3,args.local_scale,args.local_scale)),torch.empty((len(data),3,args.local_scale,args.local_scale)),
+            torch.empty((len(data),3,args.local_scale,args.local_scale)),torch.empty((len(data),3,args.local_scale,args.local_scale)),
+            torch.empty((len(data),3,args.local_scale,args.local_scale)),torch.empty((len(data),3,args.local_scale,args.local_scale)),
+            torch.empty((len(data),3,args.local_scale,args.local_scale)),torch.empty((len(data),3,args.local_scale,args.local_scale)),
+        ]
+        for i in range(len(data[0])):
+            for j in range(len(data)):
+                images[i][j] = data[j][i].crop_tensor_normed.detach().clone()
+
+        # images = [d[0] for d in data]
+        # images_coordinates = [d[1][0] for d in data]
+        # images_flips = [d[1][1][0] for d in data]
+
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            teacher_output = teacher(images[:2], args.batch_size_per_gpu, args.local_crops_number, args.patch_size, args.global_scale, args.local_scale)  # only the 2 global views pass through the teacher
+            student_output = student(images, args.batch_size_per_gpu, args.local_crops_number, args.patch_size, args.global_scale, args.local_scale)
+            loss = dino_loss(student_output, teacher_output, data, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -385,14 +423,14 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
 
 class DINOLoss(nn.Module):
-    def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
+    def __init__(self, patch_size, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
                  warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
                  center_momentum=0.9):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.ncrops = ncrops
-        self.register_buffer("center", torch.zeros(1, out_dim))
+        self.register_buffer("center", torch.zeros(1, pow(int(224/patch_size),2) + 1, out_dim))#
         # we apply a warm up for the teacher temperature because
         # a too high temperature makes the training instable at the beginning
         self.teacher_temp_schedule = np.concatenate((
@@ -401,7 +439,7 @@ class DINOLoss(nn.Module):
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
 
-    def forward(self, student_output, teacher_output, epoch):
+    def forward(self, student_output, teacher_output, data, epoch):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
@@ -414,18 +452,66 @@ class DINOLoss(nn.Module):
         teacher_out = teacher_out.detach().chunk(2)
 
         total_loss = 0
+        total_loss_mean = 0
+        total_loss_sum = 0
         n_loss_terms = 0
+        lamda = 0.7
+
         for iq, q in enumerate(teacher_out):
             for v in range(len(student_out)):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
-                loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
-                total_loss += loss.mean()
-                n_loss_terms += 1
-        total_loss /= n_loss_terms
+
+                # loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
+                # total_loss += loss.mean()
+                # n_loss_terms += 1
+
+                for k in range(len(data)):
+                    # Calculate patch correspondences:
+                    corr = correspondences(data[k][iq], data[k][v])
+                    tensor1 = teacher_out[iq][k, corr.selected_crop1_patches, :]
+                    tensor2 = student_out[v][k, corr.selected_crop2_patches, :]
+
+                    # Calculate Loss:
+                    tensor2_softmax = F.log_softmax(tensor2, dim=-1)
+                    cross_entropy_loss = - tensor1 * tensor2_softmax
+                    loss_sum = torch.sum(cross_entropy_loss, dim=-1)
+                    # step_loss = loss_sum.sum()
+
+                    total_loss_mean += loss_sum.mean()
+                    total_loss_sum += loss_sum.mean()
+                    n_loss_terms += 1
+
+                    #Method3 loss function (mean):
+                    total_loss_sum += loss_sum.mean()
+
+                    #Method2 loss function:
+                    # if len(loss_sum) == 1:
+                    #     total_loss_sum += loss_sum[0]
+                    # elif len(loss_sum) > 1:
+                    #     total_loss_sum += lamda * loss_sum[0] * (len(loss_sum)-1) + (1-lamda)*(loss_sum[1:].sum())
+
+                    #Method1 loss function:
+                    # total_loss_sum += lamda * loss_sum[0] 
+                    # if len(loss_sum) > 1:
+                    #     total_loss_sum += (1-lamda)*(loss_sum[1:].mean())
+                   
+                    n_loss_terms += 1
+        total_loss = total_loss_sum / n_loss_terms
+                
+        # total_loss /= n_loss_terms
         self.update_center(teacher_output)
         return total_loss
+
+        # Original Dino Loss Function:
+        # student_out_softmax = F.log_softmax(student_out[v], dim=-1)
+        # cross_entropy_loss = -q * student_out_softmax
+        # loss_sum = torch.sum(cross_entropy_loss, dim=-1)
+        # total_loss += loss_sum.mean()
+        # total_loss /= n_loss_terms
+        # self.update_center(teacher_output)
+        # return total_loss
 
     @torch.no_grad()
     def update_center(self, teacher_output):
@@ -441,7 +527,7 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(self, global_scale, local_scale, global_crops_scale, local_crops_scale, local_crops_number):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -453,18 +539,18 @@ class DataAugmentationDINO(object):
         normalize = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ])
+        ])####################################################################
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(global_scale, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(global_scale, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
@@ -473,19 +559,22 @@ class DataAugmentationDINO(object):
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(local_scale, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
             normalize,
         ])
 
     def __call__(self, image):
-        crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
+        global1 = augmented_crop(self.global_transfo1, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        global2 = augmented_crop(self.global_transfo2, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        
+        local_augmented_crops = []       
         for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        return crops
+            local_augmented_crops.append(augmented_crop(self.local_transfo, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale))
+
+        augmented_crops = [global1, global2] + local_augmented_crops
+        return augmented_crops
 
 
 if __name__ == '__main__':
