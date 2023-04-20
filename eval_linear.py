@@ -27,7 +27,7 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"]="0,1,3"
 
 def eval_linear(args):
     utils.init_distributed_mode(args)
@@ -69,7 +69,7 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "pixel_data_label_test"), transform=val_transform)
+    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "validation"), transform=val_transform)
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -89,7 +89,7 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "pixel_data_label_train"), transform=train_transform)
+    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -103,7 +103,7 @@ def eval_linear(args):
     # set optimizer
     optimizer = torch.optim.SGD(
         linear_classifier.parameters(),
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # linear scaling rule
+        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 1700., # linear scaling rule
         momentum=0.9,
         weight_decay=0, # we do not apply weight decay
     )
@@ -260,23 +260,23 @@ if __name__ == '__main__':
         help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
         We typically set this to False for ViT-Small and to True with ViT-Base.""")
     parser.add_argument('--arch', default='vit_tiny', type=str, help='Architecture')
-    parser.add_argument('--patch_size', default=32, type=int, help='Patch resolution of the model.')
-    parser.add_argument('--pretrained_weights', default='/home/alij/dino_alijavidani/checkpoints/mean_patch32_out1000_tiny/checkpoint.pth', type=str, help="Path to pretrained weights to evaluate.")
+    parser.add_argument('--patch_size', default=16, type=int, help='Patch resolution of the model.')
+    parser.add_argument('--pretrained_weights', default='/home/alij/dino_cifar10/loadVal/checkpoint.pth', type=str, help="Path to pretrained weights to evaluate.")
     parser.add_argument("--checkpoint_key", default="teacher", type=str, help='Key to use in the checkpoint (example: "teacher")')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument("--lr", default=0.001, type=float, help="""Learning rate at the beginning of
         training (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.
         We recommend tweaking the LR depending on the checkpoint evaluated.""")
-    parser.add_argument('--batch_size_per_gpu', default=1500, type=int, help='Per-GPU batch-size')
+    parser.add_argument('--batch_size_per_gpu', default=2700, type=int, help='Per-GPU batch-size')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
-    parser.add_argument('--data_path', default='/home/alij/Datasets/Cifar10/', type=str)
-    parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--data_path', default='/home/alij/Datasets/Imagenet100/', type=str)
+    parser.add_argument('--num_workers', default=5, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
-    parser.add_argument('--output_dir', default="./eval_linear/mean_patch32_out1000_tiny", help='Path to save logs and checkpoints')
-    parser.add_argument('--num_labels', default=10, type=int, help='Number of labels for linear classifier')
+    parser.add_argument('--output_dir', default="/home/alij/dino_cifar10/eval_linear_imagenet100/mean_patch16_out10000_tiny_fp16", help='Path to save logs and checkpoints')
+    parser.add_argument('--num_labels', default=100, type=int, help='Number of labels for linear classifier')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

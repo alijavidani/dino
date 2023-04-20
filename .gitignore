@@ -3,3 +3,5 @@
 /outputs/
 /eval_linear/
 /__pycache__/
+/loadVal/
+/eval_linear_imagenet100
