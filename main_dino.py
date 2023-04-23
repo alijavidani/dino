@@ -37,7 +37,7 @@ from augment import augmented_crop, correspondences
 import math
 
 #import os
-os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "nccl"
+# os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
 os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
@@ -124,12 +124,12 @@ def get_args_parser():
 
     # Misc
     # ImageNet path: /amin/imagenet/imagenet/train
-    parser.add_argument('--data_path', default='/home/alij/Datasets/Cifar10/pixel_data_label_train', type=str,
+    parser.add_argument('--data_path', default='F:\PhD\Datasets\cifar-10-batches-py\pixel_data_label_train', type=str,
         help='Please specify path to the ImageNet training data.')
-    parser.add_argument('--output_dir', default="./checkpoints/mean_patch32_out1000_tiny", type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--output_dir', default="./checkpoints/chatgpt_mean_patch32_out1000_tiny", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
-    parser.add_argument('--num_workers', default=15, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--num_workers', default=2, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
@@ -542,12 +542,12 @@ class DataAugmentationDINO(object):
         ])
 
     def __call__(self, image):
-        global1 = augmented_crop(self.global_transfo1, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
-        global2 = augmented_crop(self.global_transfo2, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        global1 = augmented_crop(self.global_transfo1, image, patch_size=32, global_scale=224, local_scale=96)
+        global2 = augmented_crop(self.global_transfo2, image, patch_size=32, global_scale=224, local_scale=96)
         
         local_augmented_crops = []       
         for _ in range(self.local_crops_number):
-            local_augmented_crops.append(augmented_crop(self.local_transfo, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale))
+            local_augmented_crops.append(augmented_crop(self.local_transfo, image, patch_size=32, global_scale=224, local_scale=96))
 
         augmented_crops = [global1, global2] + local_augmented_crops
         return augmented_crops
