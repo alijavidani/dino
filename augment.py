@@ -18,9 +18,11 @@ class Coordinates:
         self.right = right
 
 class augmented_crop():
-    def __init__(self, transformation, image):
+    def __init__(self, transformation, image, patch_size=16, global_scale=224, local_scale=96):
         self.transformation = transformation
-        self.patch_size = 16
+        self.patch_size = patch_size
+        self.global_scale = global_scale
+        self.local_scale = local_scale
 
         self.original_image = image
         self.original_height = image.height
@@ -29,9 +31,18 @@ class augmented_crop():
         self.number_of_patches_per_row = self.original_width//self.patch_size
         self.number_of_patches_per_column = self.original_height//self.patch_size
 
-        self.crop,[crop_properties, flip_and_color_jitter_returns] = transformation(image)
+        self.crop_tensor_normed,[crop_properties, flip_and_color_jitter_returns, normalize_returns] = transformation(image)
         # print(flip_and_color_jitter_returns)
-        
+
+        invTrans = transforms.Compose([ transforms.Normalize(mean = [ 0., 0., 0. ],
+                                                     std = [ 1/0.229, 1/0.224, 1/0.225 ]),
+                                        transforms.Normalize(mean = [ -0.485, -0.456, -0.406 ],
+                                                     std = [ 1., 1., 1. ]),
+                                       ])
+                                       
+        crop_tensor_unnormed, _ = invTrans(self.crop_tensor_normed)
+        self.crop = transforms.ToPILImage()(crop_tensor_unnormed).convert("RGB")
+
         self.is_local()
         # print(self.local)
 
@@ -45,12 +56,12 @@ class augmented_crop():
         # print(self.indices_in_original_image)
 
     def is_local(self):
-        if self.crop.size == (224,224):
-            self.side_length = 224
+        if self.crop.size == (self.global_scale, self.global_scale):
+            self.side_length = self.global_scale
             self.local = False
 
-        elif self.crop.size == (96,96):
-            self.side_length = 96
+        elif self.crop.size == (self.local_scale, self.local_scale):
+            self.side_length = self.local_scale
             self.local = True
         
         self.patches_per_side = self.side_length // self.patch_size
@@ -92,24 +103,30 @@ class correspondences():
         self.augmented_crop1 = augmented_crop1
         self.augmented_crop2 = augmented_crop2
 
-        self.find_intersection(augmented_crop1, augmented_crop2)
+        if augmented_crop1.original_image == augmented_crop2.original_image:
+            self.selected_crop1_patches = [0]
+            self.selected_crop2_patches = [0]
+
+            self.find_intersection(augmented_crop1, augmented_crop2)
+
+            if self.intersection_coordinates is not None:
+                self.crop1_patches = self.find_intersection_ids_in_crops(self.augmented_crop1)
+                self.crop2_patches = self.find_intersection_ids_in_crops(self.augmented_crop2)
+                # print(self.crop1_patches)
+                # print(self.crop2_patches)
+                selected_crop1_patches, selected_crop2_patches = self.map_crop1_to_crop2(self.crop1_patches, self.crop2_patches)
+                self.selected_crop1_patches += selected_crop1_patches
+                self.selected_crop2_patches += selected_crop2_patches
+
+        # if self.intersection_coordinates is None:
+        #     self.show_patches()
+        #     print('khr')
 
         if show_patches:
             self.show_patches()
 
-        if self.intersection_coordinates is not None:
-            self.crop1_patches = self.find_intersection_ids_in_crops(self.augmented_crop1)
-            self.crop2_patches = self.find_intersection_ids_in_crops(self.augmented_crop2)
-            # print(self.crop1_patches)
-            # print(self.crop2_patches)
-            self.selected_crop1_patches, self.selected_crop2_patches = self.map_crop1_to_crop2(self.crop1_patches, self.crop2_patches)
-
-        else:
-            self.selected_crop1_patches = []
-            self.selected_crop2_patches = []
-
-        print(self.selected_crop1_patches)
-        print(self.selected_crop2_patches)
+        # print(self.selected_crop1_patches)
+        # print(self.selected_crop2_patches)
 
 
     def find_intersection(self, augmented_crop1, augmented_crop2):
@@ -119,7 +136,7 @@ class correspondences():
         right_intersection = min(augmented_crop1.crop_coordinates.right, augmented_crop2.crop_coordinates.right)
 
         if top_intersection >= bottom_intersection or left_intersection >= right_intersection:
-            print("no intersection")
+            # print("no intersection")
             self.intersection_coordinates = None
         else:
             self.intersection_coordinates = Coordinates(top_intersection, bottom_intersection, left_intersection, right_intersection)
