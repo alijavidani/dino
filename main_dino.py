@@ -34,6 +34,7 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 from augment import augmented_crop, Coordinates
+from image_to_patches import *
 
 # import os
 os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
@@ -145,6 +146,7 @@ def train_dino(args):
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
+        args.patch_size,
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -423,7 +425,7 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, patch_size):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -432,7 +434,7 @@ class DataAugmentationDINO(object):
             ),
             transforms.RandomGrayscale(p=0.2),
         ])
-        normalize = transforms.Compose([
+        self.normalize = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
@@ -442,7 +444,7 @@ class DataAugmentationDINO(object):
             transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
-            normalize,
+            # normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
@@ -450,7 +452,7 @@ class DataAugmentationDINO(object):
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
-            normalize,
+            # normalize,
         ])
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
@@ -458,16 +460,37 @@ class DataAugmentationDINO(object):
             transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
-            normalize,
+            # normalize,
         ])
+
+        #Patch-Augmentation Variables:
+        self.num_transformations = 2
+        self.patch_size = (patch_size, patch_size)
+        self.patch_augmentation_transformations = [
+            transforms.ColorJitter(brightness=0.1, hue=0.1),
+            transforms.GaussianBlur(kernel_size=(1, 5), sigma=(0.1, 2)),
+            transforms.RandomAdjustSharpness(sharpness_factor=2),
+            transforms.RandomPosterize(bits=3),
+            # transforms.RandomAutocontrast(),
+            # transforms.AugMix(),
+            # transforms.RandAugment(num_ops=1, magnitude=1),
+            ]
 
     def __call__(self, image):
         crops = []
+        patch_augmented_crops = []
         crops.append(self.global_transfo1(image))
         crops.append(self.global_transfo2(image))
         for _ in range(self.local_crops_number):
             crops.append(self.local_transfo(image))
-        return crops
+
+        #Perform patch augmentation on each crop:
+        for crop in crops:
+            patch_augmented_crop = patch_augmentation(crop, self.patch_size, self.patch_augmentation_transformations, self.num_transformations)
+            # patch_augmented_crop.show()
+            patch_augmented_crops.append(self.normalize(patch_augmented_crop))
+
+        return patch_augmented_crops
 
 
 if __name__ == '__main__':
