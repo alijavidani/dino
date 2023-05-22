@@ -33,8 +33,9 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
-from augment import augmented_crop, correspondences
+from augment import augmented_crop, correspondences, Coordinates
 import math
+from image_to_patches import *
 
 os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "nccl"
 os.environ["CUDA_VISIBLE_DEVICES"]="0,1,3"
@@ -92,7 +93,7 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=90, type=int,
+    parser.add_argument('--batch_size_per_gpu', default=10, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -138,6 +139,7 @@ def get_args_parser():
     # My added arguments:
     parser.add_argument("--global_scale", default=224, type=int, help="size of upsampled image after crop to be fed to the teacher")
     parser.add_argument("--local_scale", default=96, type=int, help="size of upsampled image after crop to be fed to the student")
+    parser.add_argument("--patch_augmentation", default=True, type=int, help="Perform patch augmentation on the crops")
 
     return parser
 
@@ -164,6 +166,8 @@ def train_dino(args):
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
+        args.patch_augmentation,
+        args.patch_size,
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -506,7 +510,7 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_scale, local_scale, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(self, global_scale, local_scale, global_crops_scale, local_crops_scale, local_crops_number, patch_augmentation1, patch_size):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -515,7 +519,7 @@ class DataAugmentationDINO(object):
             ),
             transforms.RandomGrayscale(p=0.2),
         ])
-        normalize = transforms.Compose([
+        self.normalize = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])####################################################################
@@ -525,7 +529,7 @@ class DataAugmentationDINO(object):
             transforms.RandomResizedCrop(global_scale, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
-            normalize,
+            # normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
@@ -533,7 +537,7 @@ class DataAugmentationDINO(object):
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
-            normalize,
+            # normalize,
         ])
         # transformation for the local small crops
         self.local_crops_number = local_crops_number
@@ -541,16 +545,31 @@ class DataAugmentationDINO(object):
             transforms.RandomResizedCrop(local_scale, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
-            normalize,
+            # normalize,
         ])
 
+        #Patch-Augmentation Variables:
+        self.num_transformations = 4
+        self.patch_size = (patch_size, patch_size)
+        self.pa = PatchAugmentation(self.patch_size, self.num_transformations)
+
+        if patch_augmentation1:
+            self.global_transformation1 = transforms.Compose([self.global_transfo1, self.pa, self.normalize])
+            self.global_transformation2 = transforms.Compose([self.global_transfo2, self.pa, self.normalize])
+            self.local_transformation = transforms.Compose([self.local_transfo, self.pa, self.normalize])
+        else:
+            self.global_transformation1 = transforms.Compose([self.global_transfo1, self.normalize])
+            self.global_transformation2 = transforms.Compose([self.global_transfo2, self.normalize])
+            self.local_transformation = transforms.Compose([self.local_transfo, self.normalize])
+
+
     def __call__(self, image):
-        global1 = augmented_crop(self.global_transfo1, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
-        global2 = augmented_crop(self.global_transfo2, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        global1 = augmented_crop(self.global_transformation1, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        global2 = augmented_crop(self.global_transformation2, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
         
         local_augmented_crops = []       
         for _ in range(self.local_crops_number):
-            local_augmented_crops.append(augmented_crop(self.local_transfo, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale))
+            local_augmented_crops.append(augmented_crop(self.local_transformation, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale))
 
         augmented_crops = [global1, global2] + local_augmented_crops
         return augmented_crops

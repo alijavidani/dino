@@ -31,7 +31,7 @@ class augmented_crop():
         self.number_of_patches_per_row = self.original_width//self.patch_size
         self.number_of_patches_per_column = self.original_height//self.patch_size
 
-        self.crop_tensor_normed,[crop_properties, flip_and_color_jitter_returns, normalize_returns] = transformation(image)
+        self.crop_tensor_normed,[[crop_properties, flip_and_color_jitter_returns], normalize_returns] = transformation(image)
         # print(flip_and_color_jitter_returns)
 
         invTrans = transforms.Compose([ transforms.Normalize(mean = [ 0., 0., 0. ],
@@ -42,7 +42,8 @@ class augmented_crop():
                                        
         crop_tensor_unnormed, _ = invTrans(self.crop_tensor_normed)
         self.crop = transforms.ToPILImage()(crop_tensor_unnormed).convert("RGB")
-
+        # self.crop.save('crop.jpg')
+        
         self.is_local()
         # print(self.local)
 
