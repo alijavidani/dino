@@ -425,7 +425,7 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, patch_size):
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, patch_augmentation1):
         flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
@@ -464,33 +464,39 @@ class DataAugmentationDINO(object):
         ])
 
         #Patch-Augmentation Variables:
-        self.num_transformations = 2
-        self.patch_size = (patch_size, patch_size)
-        self.patch_augmentation_transformations = [
-            transforms.ColorJitter(brightness=0.1, hue=0.1),
-            transforms.GaussianBlur(kernel_size=(1, 5), sigma=(0.1, 2)),
-            transforms.RandomAdjustSharpness(sharpness_factor=2),
-            transforms.RandomPosterize(bits=3),
-            # transforms.RandomAutocontrast(),
-            # transforms.AugMix(),
-            # transforms.RandAugment(num_ops=1, magnitude=1),
-            ]
+        # self.num_transformations = 2
+        # self.patch_size = (patch_size, patch_size)
+        # self.patch_augmentation_transformations = [
+        #     transforms.ColorJitter(brightness=0.1, hue=0.1),
+        #     transforms.GaussianBlur(kernel_size=(1, 5), sigma=(0.1, 2)),
+        #     transforms.RandomAdjustSharpness(sharpness_factor=2),
+        #     transforms.RandomPosterize(bits=3),
+        #     # transforms.RandomAutocontrast(),
+        #     # transforms.AugMix(),
+        #     # transforms.RandAugment(num_ops=1, magnitude=1),
+        #     ]
+        self.pa = patch_augmentation()
+
+        if patch_augmentation1:
+            self.global_transformation1 = transforms.Compose([self.global_transfo1, self.pa, self.normalize])
+            self.global_transformation2 = transforms.Compose([self.global_transfo2, self.pa, self.normalize])
+            self.local_transformation = transforms.Compose([self.local_transfo, self.pa, self.normalize])
+        else:
+            self.global_transformation1 = transforms.Compose([self.global_transfo1, self.normalize])
+            self.global_transformation2 = transforms.Compose([self.global_transfo2, self.normalize])
+            self.local_transformation = transforms.Compose([self.local_transfo, self.normalize])
+
 
     def __call__(self, image):
-        crops = []
-        patch_augmented_crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
+        global1 = augmented_crop(self.global_transformation1, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        global2 = augmented_crop(self.global_transformation2, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale)
+        
+        local_augmented_crops = []       
         for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
+            local_augmented_crops.append(augmented_crop(self.local_transformation, image, patch_size=args.patch_size, global_scale=args.global_scale, local_scale=args.local_scale))
 
-        #Perform patch augmentation on each crop:
-        for crop in crops:
-            patch_augmented_crop = patch_augmentation(crop, self.patch_size, self.patch_augmentation_transformations, self.num_transformations)
-            # patch_augmented_crop.show()
-            patch_augmented_crops.append(self.normalize(patch_augmented_crop))
-
-        return patch_augmented_crops
+        augmented_crops = [global1, global2] + local_augmented_crops
+        return augmented_crops
 
 
 if __name__ == '__main__':
